@@ -777,7 +777,7 @@ async def ml_list_product_ads_campaigns(
         }
 
         campaigns = await _ml_get_api(
-            f"/advertising/advertisers/{advertiser_id}/product_ads/campaigns",
+            f"/advertising/advertisers/{advertiser_id}/product_ads/campaigns/search",
             params,
             {"Api-Version": "2"},
         )
