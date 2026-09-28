@@ -507,6 +507,149 @@ async def ml_list_orders(
 
 
 @mcp.tool()
+async def ml_sales_summary(
+    date_from: str = "2026-09-01",
+    date_to: str = "2026-09-28",
+) -> dict:
+    """
+    Gera um resumo consolidado de vendas por período.
+
+    Inclui pedidos pagos, unidades vendidas, receita dos itens, valor pago,
+    taxas, descontos/reembolsos e um detalhamento por anúncio. Os pedidos são
+    deduplicados pelo ID e pagamentos múltiplos do mesmo pedido não são somados
+    duas vezes.
+    """
+    try:
+        start = date.fromisoformat(date_from)
+        end = date.fromisoformat(date_to)
+        if end < start:
+            return {"error": "date_to must be on or after date_from"}
+    except ValueError:
+        return {"error": "date_from and date_to must use YYYY-MM-DD"}
+
+    try:
+        user_id = await _get_user_id()
+        orders_by_id: dict[str, dict] = {}
+        offset = 0
+        page_size = 50
+
+        # The API filter narrows the response; the local date check below keeps
+        # the result correct even if ML interprets the boundary in UTC.
+        api_params = {
+            "seller": user_id,
+            "order.status": "paid",
+            "sort": "date_asc",
+            "limit": page_size,
+            "order.date_created.from": f"{date_from}T00:00:00.000-03:00",
+            "order.date_created.to": f"{date_to}T23:59:59.999-03:00",
+        }
+
+        while True:
+            params = {**api_params, "offset": offset}
+            page = await _ml_get("/orders/search", params)
+            results = page.get("results", [])
+            if not results:
+                break
+
+            for order in results:
+                order_id = str(order.get("id", ""))
+                created = str(order.get("date_created", ""))[:10]
+                if order_id and date_from <= created <= date_to:
+                    orders_by_id[order_id] = order
+
+            paging = page.get("paging", {})
+            total = paging.get("total")
+            offset += len(results)
+            if len(results) < page_size or (isinstance(total, int) and offset >= total):
+                break
+            if offset >= 10000:
+                logger.warning("Sales summary pagination capped at 10000 orders")
+                break
+
+        orders = list(orders_by_id.values())
+        item_totals: dict[str, dict] = {}
+        units_sold = 0
+        item_revenue = 0.0
+        list_price_revenue = 0.0
+        paid_amount = 0.0
+        refunded_amount = 0.0
+        sale_fees = 0.0
+        refunded_orders = 0
+        orders_with_refund = 0
+
+        for order in orders:
+            order_refund = 0.0
+            for payment in order.get("payments", []) or []:
+                order_refund += float(payment.get("transaction_amount_refunded") or 0)
+            refunded_amount += order_refund
+            if order_refund > 0:
+                orders_with_refund += 1
+
+            order_paid = float(order.get("paid_amount") or 0)
+            if order_paid > 0 and order_refund >= order_paid:
+                refunded_orders += 1
+            paid_amount += max(order_paid - order_refund, 0.0)
+
+            for line in order.get("order_items", []) or []:
+                item = line.get("item", {}) or {}
+                item_id = str(item.get("id", "unknown"))
+                title = item.get("title", item_id)
+                quantity = int(line.get("quantity") or 0)
+                unit_price = float(line.get("unit_price") or 0)
+                gross_price = float(line.get("gross_price") or unit_price)
+                fee = float(line.get("sale_fee") or 0)
+                units_sold += quantity
+                item_revenue += unit_price * quantity
+                list_price_revenue += gross_price * quantity
+                sale_fees += fee
+
+                bucket = item_totals.setdefault(
+                    item_id,
+                    {
+                        "item_id": item_id,
+                        "title": title,
+                        "units": 0,
+                        "item_revenue": 0.0,
+                        "list_price_revenue": 0.0,
+                        "sale_fees": 0.0,
+                    },
+                )
+                bucket["units"] += quantity
+                bucket["item_revenue"] += unit_price * quantity
+                bucket["list_price_revenue"] += gross_price * quantity
+                bucket["sale_fees"] += fee
+
+        def money(value: float) -> float:
+            return round(value + 1e-9, 2)
+
+        for bucket in item_totals.values():
+            bucket["item_revenue"] = money(bucket["item_revenue"])
+            bucket["list_price_revenue"] = money(bucket["list_price_revenue"])
+            bucket["sale_fees"] = money(bucket["sale_fees"])
+
+        return {
+            "period": {
+                "date_from": date_from,
+                "date_to": date_to,
+                "timezone": "America/Sao_Paulo",
+            },
+            "currency": "BRL",
+            "orders": len(orders),
+            "units_sold": units_sold,
+            "item_revenue": money(item_revenue),
+            "list_price_revenue": money(list_price_revenue),
+            "paid_amount_net_of_refunds": money(paid_amount),
+            "refunded_amount": money(refunded_amount),
+            "sale_fees": money(sale_fees),
+            "orders_with_refund": orders_with_refund,
+            "fully_refunded_orders": refunded_orders,
+            "items": sorted(item_totals.values(), key=lambda row: row["item_revenue"], reverse=True),
+        }
+    except Exception as e:
+        return _error(str(e), "Failed to generate sales summary")
+
+
+@mcp.tool()
 async def ml_get_order(order_id: str) -> dict:
     """Obtiene un pedido por su ID."""
     if not _RE_NUMERIC_ID.match(order_id):
