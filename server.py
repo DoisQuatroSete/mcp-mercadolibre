@@ -34,7 +34,7 @@ _RATE_LIMIT_RPM  = int(os.environ.get("RATE_LIMIT_RPM", "60"))
 _MAX_TRACKED_IPS = int(os.environ.get("RATE_LIMIT_MAX_IPS", "10000"))
 _TRUSTED_PROXIES = int(os.environ.get("TRUSTED_PROXY_COUNT", "1"))
 
-ML_AUTH_BASE = "https://auth.mercadolibre.com.ar"
+ML_AUTH_BASE = "https://auth.mercadolivre.com.br"
 ML_API_BASE  = "https://api.mercadolibre.com"
 ML_TOKEN_URL = f"{ML_API_BASE}/oauth/token"
 
