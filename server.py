@@ -575,7 +575,92 @@ async def ml_get_category_attributes(category_id: str) -> dict:
 # ---------------------------------------------------------------------------
 # Middleware de autenticación
 # ---------------------------------------------------------------------------
+from datetime import date, timedelta
 
+async def _ml_get_api(path: str, params: dict | None = None, extra_headers: dict | None = None) -> Any:
+    token = await _token_manager.get_token()
+    headers = {"Authorization": f"Bearer {token}"}
+    if extra_headers:
+        headers.update(extra_headers)
+    async with httpx.AsyncClient(timeout=_ML_TIMEOUT) as client:
+        resp = await client.get(f"{ML_API_BASE}{path}", headers=headers, params=params or {})
+        resp.raise_for_status()
+        return resp.json()
+
+@mcp.tool()
+async def ml_list_product_ads_campaigns(
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """Lista campanhas Product Ads e métricas de impressões, cliques, CTR, gasto e vendas."""
+    try:
+        today = date.today()
+        date_to = date_to or today.isoformat()
+        date_from = date_from or (today - timedelta(days=29)).isoformat()
+
+        advertisers_raw = await _ml_get_api(
+            "/advertising/advertisers",
+            {"product_id": "PADS"},
+            {"Api-Version": "2"},
+        )
+        advertisers = (
+            advertisers_raw
+            if isinstance(advertisers_raw, list)
+            else advertisers_raw.get(
+                "advertisers",
+                advertisers_raw.get("results", []),
+            )
+        )
+
+        if not advertisers:
+            return {"advertisers": [], "campaigns": [], "message": "Nenhum anunciante Product Ads encontrado."}
+
+        advertiser_id = advertisers[0].get("id") or advertisers[0].get("advertiser_id")
+        if not advertiser_id:
+            return {"error": "O Mercado Livre não retornou um advertiser_id."}
+
+        params = {
+            "limit": min(max(limit, 1), 50),
+            "offset": max(offset, 0),
+            "date_from": date_from,
+            "date_to": date_to,
+            "metrics": (
+                "clicks,prints,ctr,cost,cpc,acos,cvr,roas,"
+                "units_quantity,total_amount"
+            ),
+            "metrics_summary": "true",
+        }
+
+        campaigns = await _ml_get_api(
+            f"/advertising/advertisers/{advertiser_id}/product_ads/campaigns",
+            params,
+            {"Api-Version": "2"},
+        )
+
+        return {
+            "advertiser_id": advertiser_id,
+            "date_from": date_from,
+            "date_to": date_to,
+            "campaigns": campaigns,
+        }
+    except Exception as e:
+        return _error(str(e), "Failed to list Product Ads campaigns")
+
+@mcp.tool()
+async def ml_get_item_promotions(item_id: str) -> dict:
+    """Consulta promoções e eventual participação financeira do Mercado Livre para um anúncio."""
+    if not _RE_ITEM_ID.match(item_id):
+        return {"error": f"Invalid item_id format (expected {ML_SITE} + digits)"}
+    try:
+        return await _ml_get_api(
+            f"/seller-promotions/items/{item_id}",
+            {"app_version": "v2"},
+        )
+    except Exception as e:
+        return _error(str(e), "Failed to get item promotions")
+        
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
