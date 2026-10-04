@@ -6,6 +6,9 @@ import logging
 import time
 import asyncio
 import secrets
+import base64
+import hashlib
+import hmac
 from collections import deque
 from typing import Optional, Any
 from urllib.parse import urlencode
