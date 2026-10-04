@@ -6,9 +6,6 @@ import logging
 import time
 import asyncio
 import secrets
-import base64
-import hashlib
-import hmac
 from collections import deque
 from typing import Optional, Any
 from urllib.parse import urlencode
@@ -41,37 +38,15 @@ ML_AUTH_BASE = "https://auth.mercadolivre.com.br"
 ML_API_BASE  = "https://api.mercadolibre.com"
 ML_TOKEN_URL = f"{ML_API_BASE}/oauth/token"
 
-# Mercado Pago Brasil: OAuth separado do Mercado Livre.
-MP_CLIENT_ID          = os.environ.get("MP_CLIENT_ID", "")
-MP_CLIENT_SECRET      = os.environ.get("MP_CLIENT_SECRET", "")
-MP_REDIRECT_URI       = os.environ.get("MP_REDIRECT_URI", "")
-MP_AUTH_BASE          = "https://auth.mercadopago.com"
-MP_API_BASE           = "https://api.mercadopago.com"
-MP_TOKEN_URL          = f"{MP_API_BASE}/oauth/token"
-_MP_TIMEOUT           = httpx.Timeout(30.0)
-
-
-def _make_mp_state() -> str:
-    """Cria um state assinado, sem depender da memória/replica do Railway."""
-    payload = f"{int(time.time())}:{secrets.token_urlsafe(18)}"
-    key = (BEARER_TOKEN or MP_CLIENT_SECRET).encode()
-    signature = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
-    raw = f"{payload}:{signature}".encode()
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
-
-
-def _verify_mp_state(state: str) -> bool:
-    try:
-        raw = base64.urlsafe_b64decode(state + "=" * (-len(state) % 4)).decode()
-        timestamp, nonce, signature = raw.split(":", 2)
-        payload = f"{timestamp}:{nonce}"
-        if int(time.time()) - int(timestamp) > 900:
-            return False
-        key = (BEARER_TOKEN or MP_CLIENT_SECRET).encode()
-        expected = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(signature, expected)
-    except Exception:
-        return False
+# Mercado Pago Brasil: acesso à própria conta por Client Credentials.
+MP_CLIENT_ID = os.environ.get("MP_CLIENT_ID", "")
+MP_CLIENT_SECRET = os.environ.get("MP_CLIENT_SECRET", "")
+MP_AUTH_MODE = os.environ.get("MP_AUTH_MODE", "client_credentials").strip().lower()
+MP_API_BASE = "https://api.mercadopago.com"
+MP_TOKEN_URL = f"{MP_API_BASE}/oauth/token"
+MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
+MP_REFRESH_TOKEN = os.environ.get("MP_REFRESH_TOKEN", "")
+_MP_TIMEOUT = httpx.Timeout(30.0)
 
 # Se aplica a cada llamada saliente a la API de ML — evita que los workers queden colgados
 # cuando ML está lento o no responde.
@@ -205,18 +180,21 @@ _token_manager = TokenManager(TOKEN_REFRESH_BUFFER)
 
 
 class MPTokenManager:
-    """Gerencia os tokens OAuth 2.0 próprios do Mercado Pago."""
+    """Obtém token próprio do Mercado Pago ou usa OAuth autorizado explicitamente."""
 
     def __init__(self, refresh_buffer: int = 1800):
         self._refresh_buffer = refresh_buffer
-        self._access_token = os.environ.get("MP_ACCESS_TOKEN", "")
-        self._refresh_token = os.environ.get("MP_REFRESH_TOKEN", "")
+        self._access_token = MP_ACCESS_TOKEN
+        self._refresh_token = MP_REFRESH_TOKEN
         self._expires_at = time.monotonic() + 21600 if self._access_token else 0.0
         self._lock = asyncio.Lock()
 
-    def set_tokens(self, access_token: str, refresh_token: str, expires_in: int = 21600) -> None:
+    def set_tokens(self, access_token: str, refresh_token: str = "", expires_in: int = 21600) -> None:
+        if not access_token:
+            raise RuntimeError("Mercado Pago não retornou access_token")
         self._access_token = access_token
-        self._refresh_token = refresh_token or self._refresh_token
+        if refresh_token:
+            self._refresh_token = refresh_token
         self._expires_at = time.monotonic() + max(int(expires_in or 21600), 60)
 
     async def get_token(self) -> str:
@@ -225,30 +203,87 @@ class MPTokenManager:
         async with self._lock:
             if self._access_token and time.monotonic() < self._expires_at - self._refresh_buffer:
                 return self._access_token
-            await self._do_refresh()
+            await self._obtain_token()
             return self._access_token
 
-    async def _do_refresh(self) -> None:
-        if not self._refresh_token:
-            raise RuntimeError("MP_REFRESH_TOKEN ausente; complete o OAuth em /mp/auth/url")
+    async def _obtain_token(self) -> None:
         if not MP_CLIENT_ID or not MP_CLIENT_SECRET:
             raise RuntimeError("MP_CLIENT_ID e MP_CLIENT_SECRET precisam estar configurados")
-        async with httpx.AsyncClient(timeout=_MP_TIMEOUT) as client:
-            resp = await client.post(MP_TOKEN_URL, json={
-                "grant_type": "refresh_token",
+
+        if MP_AUTH_MODE == "client_credentials":
+            payload = {
                 "client_id": MP_CLIENT_ID,
                 "client_secret": MP_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            }
+        elif MP_AUTH_MODE in {"authorization_code", "oauth"}:
+            if not self._refresh_token:
+                raise RuntimeError("MP_REFRESH_TOKEN ausente para o modo authorization_code")
+            payload = {
+                "client_id": MP_CLIENT_ID,
+                "client_secret": MP_CLIENT_SECRET,
+                "grant_type": "refresh_token",
                 "refresh_token": self._refresh_token,
-            })
+            }
+        else:
+            raise RuntimeError("MP_AUTH_MODE inválido; use client_credentials ou authorization_code")
+
+        async with httpx.AsyncClient(timeout=_MP_TIMEOUT) as client:
+            resp = await client.post(
+                MP_TOKEN_URL,
+                headers={"Accept": "application/json", "Content-Type": "application/json"},
+                json=payload,
+            )
         if resp.status_code != 200:
-            logger.error("Mercado Pago token refresh failed: status=%s body=%s", resp.status_code, resp.text[:500])
-            raise RuntimeError(f"Mercado Pago token refresh failed: {resp.status_code}")
+            logger.error("Mercado Pago token failed: status=%s body=%s", resp.status_code, resp.text[:500])
+            raise RuntimeError(f"Mercado Pago token failed: HTTP {resp.status_code}")
         data = resp.json()
         self.set_tokens(data.get("access_token", ""), data.get("refresh_token", ""), data.get("expires_in", 21600))
-        logger.warning("MP tokens refreshed. Atualize MP_ACCESS_TOKEN e MP_REFRESH_TOKEN no Railway sem registrar os valores no log.")
-
 
 _mp_token_manager = MPTokenManager(TOKEN_REFRESH_BUFFER)
+
+async def _mp_get(path: str, params: dict | None = None) -> Any:
+    token = await _mp_token_manager.get_token()
+    async with httpx.AsyncClient(timeout=_MP_TIMEOUT) as client:
+        resp = await client.get(
+            f"{MP_API_BASE}{path}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            params=params or {},
+        )
+    resp.raise_for_status()
+    return resp.json()
+
+async def _mp_post(path: str, body: dict) -> Any:
+    token = await _mp_token_manager.get_token()
+    async with httpx.AsyncClient(timeout=_MP_TIMEOUT) as client:
+        resp = await client.post(
+            f"{MP_API_BASE}{path}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+    if resp.status_code not in {200, 201, 202, 203, 204}:
+        raise RuntimeError(f"Mercado Pago API HTTP {resp.status_code}: {resp.text[:500]}")
+    if not resp.content:
+        return {"status_code": resp.status_code}
+    try:
+        return resp.json()
+    except ValueError:
+        return {"status_code": resp.status_code, "content": resp.text}
+
+async def _mp_download(path: str) -> dict:
+    token = await _mp_token_manager.get_token()
+    async with httpx.AsyncClient(timeout=_MP_TIMEOUT) as client:
+        resp = await client.get(f"{MP_API_BASE}{path}", headers={"Authorization": f"Bearer {token}"})
+    resp.raise_for_status()
+    content_type = resp.headers.get("content-type", "application/octet-stream")
+    if "text" in content_type or "csv" in content_type:
+        return {"content_type": content_type, "content": resp.text}
+    import base64
+    return {"content_type": content_type, "content_base64": base64.b64encode(resp.content).decode("ascii")}
 
 # ---------------------------------------------------------------------------
 # Cache del ID de usuario (evita llamadas repetidas a /users/me)
@@ -321,36 +356,6 @@ async def _ml_put(path: str, body: dict) -> Any:
     return resp.json()
 
 
-async def _mp_get(path: str, params: dict | None = None) -> Any:
-    token = await _mp_token_manager.get_token()
-    async with httpx.AsyncClient(timeout=_MP_TIMEOUT) as client:
-        resp = await client.get(f"{MP_API_BASE}{path}", headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}, params=params or {})
-    resp.raise_for_status()
-    return resp.json()
-
-
-async def _mp_post(path: str, body: dict) -> Any:
-    token = await _mp_token_manager.get_token()
-    async with httpx.AsyncClient(timeout=_MP_TIMEOUT) as client:
-        resp = await client.post(f"{MP_API_BASE}{path}", headers={"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"}, json=body)
-    resp.raise_for_status()
-    if resp.status_code == 204 or not resp.content:
-        return {"status_code": resp.status_code}
-    return resp.json()
-
-
-async def _mp_download(path: str) -> dict:
-    token = await _mp_token_manager.get_token()
-    async with httpx.AsyncClient(timeout=_MP_TIMEOUT) as client:
-        resp = await client.get(f"{MP_API_BASE}{path}", headers={"Authorization": f"Bearer {token}"})
-    resp.raise_for_status()
-    content_type = resp.headers.get("content-type", "application/octet-stream")
-    if "text" in content_type or "csv" in content_type:
-        return {"content_type": content_type, "content": resp.text}
-    import base64
-    return {"content_type": content_type, "content_base64": base64.b64encode(resp.content).decode("ascii")}
-
-
 # ---------------------------------------------------------------------------
 # Modelos de entrada
 # ---------------------------------------------------------------------------
@@ -361,7 +366,7 @@ class CreateItemInput(BaseModel):
     title:              str            = Field(..., min_length=1, max_length=60)
     category_id:        str            = Field(..., pattern=rf"^{ML_SITE}\d+$")
     price:              float          = Field(..., gt=0)
-    currency_id:        str            = Field("ARS", pattern=r"^[A-Z]{3}$")
+    currency_id:        str            = Field("BRL", pattern=r"^[A-Z]{3}$")
     available_quantity: int            = Field(..., ge=0)
     buying_mode:        str            = Field("buy_it_now")
     listing_type_id:    str            = Field("gold_special")
@@ -828,99 +833,118 @@ async def ml_get_category_attributes(category_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Ferramentas somente leitura do Mercado Pago
+# Mercado Pago: leitura financeira
 # ---------------------------------------------------------------------------
 
-def _mp_id(value: str, name: str) -> str | None:
-    if not value or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
-        return f"Invalid {name}"
-    return None
-
+@mcp.tool()
+async def mp_get_my_user() -> dict:
+    """Consulta o usuário da conta Mercado Pago autenticada."""
+    try:
+        return await _mp_get("/users/me")
+    except Exception as e:
+        return _error(str(e), "Failed to get Mercado Pago user")
 
 @mcp.tool()
 async def mp_get_payment(payment_id: str) -> dict:
-    """Consulta um pagamento do Mercado Pago por ID."""
-    error = _mp_id(payment_id, "payment_id")
-    if error:
-        return {"error": error}
+    """Consulta um pagamento Mercado Pago por ID."""
+    if not _RE_NUMERIC_ID.match(str(payment_id)):
+        return {"error": "payment_id must contain digits only"}
     try:
         return await _mp_get(f"/v1/payments/{payment_id}")
     except Exception as e:
         return _error(str(e), "Failed to get Mercado Pago payment")
 
-
 @mcp.tool()
-async def mp_search_payments(date_from: str | None = None, date_to: str | None = None, criteria: str = "date_approved", sort: str = "desc", limit: int = 50, offset: int = 0) -> dict:
-    """Pesquisa pagamentos do Mercado Pago por período."""
-    if criteria not in {"date_created", "date_approved", "date_last_updated", "money_release_date"}:
-        return {"error": "criteria inválido"}
-    if sort not in {"asc", "desc"}:
-        return {"error": "sort deve ser asc ou desc"}
-    params: dict[str, Any] = {"sort": f"{criteria}:{sort}", "criteria": criteria, "limit": min(max(limit, 1), 100), "offset": max(offset, 0)}
-    if date_from and date_to:
-        params.update({"range": "date_created", "begin_date": date_from, "end_date": date_to})
+async def mp_search_payments(
+    external_reference: Optional[str] = None,
+    status: Optional[str] = None,
+    begin_date: str = "NOW-30DAYS",
+    end_date: str = "NOW",
+    range_field: str = "date_created",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict:
+    """Pesquisa pagamentos aprovados ou outros movimentos de pagamento."""
+    allowed_ranges = {"date_created", "date_last_updated", "date_approved", "money_release_date"}
+    if range_field not in allowed_ranges:
+        return {"error": f"range_field must be one of: {', '.join(sorted(allowed_ranges))}"}
+    params = {
+        "sort": range_field,
+        "criteria": "desc",
+        "range": range_field,
+        "begin_date": begin_date,
+        "end_date": end_date,
+        "limit": min(max(limit, 1), 50),
+        "offset": max(offset, 0),
+    }
+    if external_reference:
+        params["external_reference"] = external_reference
+    if status:
+        params["status"] = status
     try:
         return await _mp_get("/v1/payments/search", params)
     except Exception as e:
         return _error(str(e), "Failed to search Mercado Pago payments")
 
+async def _mp_generate_report(report_type: str, begin_date: str, end_date: str) -> dict:
+    if report_type not in {"settlement", "release"}:
+        raise ValueError("invalid report type")
+    return await _mp_post(
+        f"/v1/account/{report_type}_report",
+        {"begin_date": begin_date, "end_date": end_date},
+    )
 
 @mcp.tool()
-async def mp_generate_settlement_report(begin_date: str, end_date: str) -> dict:
-    """Gera relatório de dinheiro em conta; não altera pagamentos."""
+async def mp_generate_account_money_report(begin_date: str, end_date: str) -> dict:
+    """Gera relatório Account Money, com operações, taxas e impacto líquido."""
     try:
-        return await _mp_post("/v1/account/settlement_report", {"begin_date": begin_date, "end_date": end_date})
+        return await _mp_generate_report("settlement", begin_date, end_date)
     except Exception as e:
-        return _error(str(e), "Failed to generate settlement report")
-
+        return _error(str(e), "Failed to generate Account Money report")
 
 @mcp.tool()
-async def mp_list_settlement_reports(limit: int = 30, offset: int = 0) -> dict:
-    """Lista relatórios de dinheiro em conta já gerados."""
+async def mp_list_account_money_reports() -> dict:
+    """Lista relatórios Account Money já gerados."""
     try:
-        return await _mp_get("/v1/account/settlement_report/search", {"limit": min(max(limit, 1), 100), "offset": max(offset, 0)})
+        return {"reports": await _mp_get("/v1/account/settlement_report/list")}
     except Exception as e:
-        return _error(str(e), "Failed to list settlement reports")
-
+        return _error(str(e), "Failed to list Account Money reports")
 
 @mcp.tool()
-async def mp_download_settlement_report(file_name: str) -> dict:
-    """Baixa um relatório de dinheiro em conta por nome de arquivo."""
-    if "/" in file_name or "\\" in file_name or not file_name:
-        return {"error": "Invalid file_name"}
+async def mp_download_account_money_report(file_name: str) -> dict:
+    """Baixa um relatório Account Money pelo nome retornado pela API."""
+    if not file_name or "/" in file_name or "\\" in file_name:
+        return {"error": "file_name inválido"}
     try:
         return await _mp_download(f"/v1/account/settlement_report/{file_name}")
     except Exception as e:
-        return _error(str(e), "Failed to download settlement report")
-
+        return _error(str(e), "Failed to download Account Money report")
 
 @mcp.tool()
-async def mp_generate_release_report(begin_date: str, end_date: str) -> dict:
-    """Gera relatório de liberações; não altera pagamentos."""
+async def mp_generate_released_money_report(begin_date: str, end_date: str) -> dict:
+    """Gera relatório Released Money, com liberações, taxas e datas de recebimento."""
     try:
-        return await _mp_post("/v1/account/release_report", {"begin_date": begin_date, "end_date": end_date})
+        return await _mp_generate_report("release", begin_date, end_date)
     except Exception as e:
-        return _error(str(e), "Failed to generate release report")
-
+        return _error(str(e), "Failed to generate Released Money report")
 
 @mcp.tool()
-async def mp_list_release_reports(limit: int = 30, offset: int = 0) -> dict:
-    """Lista relatórios de liberações já gerados."""
+async def mp_list_released_money_reports() -> dict:
+    """Lista relatórios Released Money já gerados."""
     try:
-        return await _mp_get("/v1/account/release_report/search", {"limit": min(max(limit, 1), 100), "offset": max(offset, 0)})
+        return {"reports": await _mp_get("/v1/account/release_report/list")}
     except Exception as e:
-        return _error(str(e), "Failed to list release reports")
-
+        return _error(str(e), "Failed to list Released Money reports")
 
 @mcp.tool()
-async def mp_download_release_report(file_name: str) -> dict:
-    """Baixa um relatório de liberações por nome de arquivo."""
-    if "/" in file_name or "\\" in file_name or not file_name:
-        return {"error": "Invalid file_name"}
+async def mp_download_released_money_report(file_name: str) -> dict:
+    """Baixa um relatório Released Money pelo nome retornado pela API."""
+    if not file_name or "/" in file_name or "\\" in file_name:
+        return {"error": "file_name inválido"}
     try:
         return await _mp_download(f"/v1/account/release_report/{file_name}")
     except Exception as e:
-        return _error(str(e), "Failed to download release report")
+        return _error(str(e), "Failed to download Released Money report")
 
 
 # ---------------------------------------------------------------------------
@@ -1022,37 +1046,6 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if not await _check_rate_limit(ip):
             return JSONResponse({"error": "Too many requests"}, status_code=429)
 
-        # OAuth separado do Mercado Pago Brasil.
-        if path == "/mp/auth/url":
-            if not MP_CLIENT_ID or not MP_REDIRECT_URI:
-                return JSONResponse({"error": "MP_CLIENT_ID and MP_REDIRECT_URI must be set"}, status_code=500)
-            state = _make_mp_state()
-            params = urlencode({"response_type": "code", "client_id": MP_CLIENT_ID, "platform_id": "mp", "state": state, "redirect_uri": MP_REDIRECT_URI})
-            return JSONResponse({"auth_url": f"{MP_AUTH_BASE}/authorization?{params}", "redirect_uri": MP_REDIRECT_URI})
-
-        if path == "/mp/auth/callback":
-            code = request.query_params.get("code", "")
-            state = request.query_params.get("state", "")
-            if not code:
-                return HTMLResponse("Missing code parameter", status_code=400)
-            if not _verify_mp_state(state):
-                return HTMLResponse("Invalid OAuth state", status_code=400)
-            if not MP_CLIENT_ID or not MP_CLIENT_SECRET or not MP_REDIRECT_URI:
-                return HTMLResponse("Mercado Pago OAuth is not configured in Railway", status_code=500)
-            try:
-                async with httpx.AsyncClient(timeout=_MP_TIMEOUT) as client:
-                    resp = await client.post(MP_TOKEN_URL, json={"grant_type": "authorization_code", "client_id": MP_CLIENT_ID, "client_secret": MP_CLIENT_SECRET, "code": code, "redirect_uri": MP_REDIRECT_URI})
-                if resp.status_code != 200:
-                    logger.error("Mercado Pago OAuth exchange failed: status=%s body=%s", resp.status_code, resp.text[:500])
-                    return HTMLResponse(f"<h2>Mercado Pago OAuth failed (HTTP {resp.status_code})</h2><p>Check Railway logs.</p>", status_code=502)
-                data = resp.json()
-                _mp_token_manager.set_tokens(data.get("access_token", ""), data.get("refresh_token", ""), data.get("expires_in", 21600))
-                logger.warning("Mercado Pago OAuth complete. Configure MP_ACCESS_TOKEN and MP_REFRESH_TOKEN securely in Railway; token values are not printed.")
-                return HTMLResponse("<h2>Mercado Pago authorization complete.</h2><p>The token is active for this process. Save the returned credentials securely in Railway before restarting.</p>")
-            except Exception as e:
-                logger.error("Mercado Pago OAuth callback error: %s", e)
-                return HTMLResponse("Internal error. Check Railway logs.", status_code=500)
-
         # Callback de OAuth — intercambia el código de autorización por tokens.
         if path == "/auth/callback":
             code = request.query_params.get("code", "")
@@ -1098,7 +1091,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                     data["refresh_token"],
                     data.get("expires_in", 21600),
                 )
-                logger.warning("Mercado Livre OAuth complete. Configure ML_ACCESS_TOKEN and ML_REFRESH_TOKEN securely in Railway; token values are not printed.")
+                logger.warning(
+                    "OAuth complete. Save these in your environment — "
+                    "ML_ACCESS_TOKEN=%s ML_REFRESH_TOKEN=%s",
+                    data["access_token"], data["refresh_token"],
+                )
                 return HTMLResponse(
                     "<h2>Authorization complete.</h2>"
                     "<p>Copy the tokens from your server logs and set them as "
@@ -1190,8 +1187,6 @@ if __name__ == "__main__":
 
     if not ML_CLIENT_ID:
         logger.warning("ML_CLIENT_ID is not set")
-    if not MP_CLIENT_ID:
-        logger.warning("MP_CLIENT_ID is not set; Mercado Pago tools will remain unavailable")
     if ALLOW_TOKEN_QUERY_PARAM:
         logger.info("Token query param: ENABLED")
     else:
@@ -1199,6 +1194,7 @@ if __name__ == "__main__":
 
     logger.info("Bearer auth: %s", "ENABLED" if BEARER_TOKEN else "DISABLED")
     logger.info("MCP endpoint: http://0.0.0.0:%d/mcp", PORT)
+    logger.info("Mercado Pago auth mode: %s", MP_AUTH_MODE)
 
     # Deshabilita el access log de uvicorn cuando ?token= está activo — de lo contrario
     # registraría la URL completa, incluyendo el token.
