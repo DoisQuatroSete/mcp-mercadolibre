@@ -23,6 +23,7 @@ from starlette.responses import JSONResponse, HTMLResponse
 # ---------------------------------------------------------------------------
 
 ML_CLIENT_ID         = os.environ.get("ML_CLIENT_ID", "")
+ML_CLIENT_SECRET     = os.environ.get("ML_CLIENT_SECRET", "")
 ML_SITE              = os.environ.get("ML_SITE", "MLB")
 TOKEN_REFRESH_BUFFER = int(os.environ.get("TOKEN_REFRESH_BUFFER", "1800"))
 BEARER_TOKEN         = os.environ.get("BEARER_TOKEN", "")
@@ -133,8 +134,11 @@ class TokenManager:
         self._refresh_token: str   = os.environ.get("ML_REFRESH_TOKEN", "")
         # Si se proveyó un token por variable de entorno, se asume que está vigente (los tokens de ML duran 6 h).
         # Poner _expires_at en 0 dispararía una renovación innecesaria en la primera llamada.
+        # Não presumimos que um token salvo no Railway ainda esteja dentro das 6h.
         self._expires_at: float = (
-            time.monotonic() + 21600 if self._access_token else 0.0
+            time.monotonic() + 21600
+            if self._access_token and not self._refresh_token
+            else 0.0
         )
         self._lock = asyncio.Lock()
 
@@ -155,8 +159,8 @@ class TokenManager:
     async def _do_refresh(self) -> None:
         if not self._refresh_token:
             raise RuntimeError("No ML_REFRESH_TOKEN available — complete OAuth flow first via /auth/url")
-        client_id     = os.environ.get("ML_CLIENT_ID", "")
-        client_secret = os.environ.get("ML_CLIENT_SECRET", "")
+        client_id     = ML_CLIENT_ID
+        client_secret = ML_CLIENT_SECRET
         async with httpx.AsyncClient(timeout=_ML_TIMEOUT) as client:
             resp = await client.post(ML_TOKEN_URL, data={
                 "grant_type":    "refresh_token",
@@ -168,12 +172,18 @@ class TokenManager:
             logger.error("Token refresh failed (%s): %s", resp.status_code, resp.text[:500])
             raise RuntimeError(f"Token refresh failed: {resp.status_code}")
         data = resp.json()
-        self.set_tokens(data["access_token"], data["refresh_token"], data.get("expires_in", 21600))
-        # ML rota los refresh tokens — quien llama debe actualizar ML_REFRESH_TOKEN en su entorno.
-        logger.warning(
-            "ML tokens refreshed. Update ML_REFRESH_TOKEN in your environment: %s",
-            data["refresh_token"],
+        self.set_tokens(
+            data["access_token"],
+            data.get("refresh_token") or self._refresh_token,
+            data.get("expires_in", 21600),
         )
+        logger.warning("ML token refreshed. Persist the rotated refresh token in Railway variables.")
+
+    async def force_refresh(self) -> None:
+        """Força renovação depois de uma resposta 401 do Mercado Livre."""
+        async with self._lock:
+            self._expires_at = 0.0
+            await self._do_refresh()
 
 
 _token_manager = TokenManager(TOKEN_REFRESH_BUFFER)
@@ -321,37 +331,52 @@ def _error(detail: str, public_msg: str = "An error occurred") -> dict:
 
 
 async def _ml_get(path: str, params: dict | None = None) -> Any:
-    token = await _token_manager.get_token()
     async with httpx.AsyncClient(timeout=_ML_TIMEOUT) as client:
-        resp = await client.get(
-            f"{ML_API_BASE}{path}",
-            headers={"Authorization": f"Bearer {token}"},
-            params=params or {},
-        )
+        for attempt in range(2):
+            token = await _token_manager.get_token()
+            resp = await client.get(
+                f"{ML_API_BASE}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params or {},
+            )
+            if resp.status_code == 401 and attempt == 0 and _token_manager._refresh_token:
+                await _token_manager.force_refresh()
+                continue
+            break
     resp.raise_for_status()
     return resp.json()
 
 
 async def _ml_post(path: str, body: dict) -> Any:
-    token = await _token_manager.get_token()
     async with httpx.AsyncClient(timeout=_ML_TIMEOUT) as client:
-        resp = await client.post(
-            f"{ML_API_BASE}{path}",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body,
-        )
+        for attempt in range(2):
+            token = await _token_manager.get_token()
+            resp = await client.post(
+                f"{ML_API_BASE}{path}",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=body,
+            )
+            if resp.status_code == 401 and attempt == 0 and _token_manager._refresh_token:
+                await _token_manager.force_refresh()
+                continue
+            break
     resp.raise_for_status()
     return resp.json()
 
 
 async def _ml_put(path: str, body: dict) -> Any:
-    token = await _token_manager.get_token()
     async with httpx.AsyncClient(timeout=_ML_TIMEOUT) as client:
-        resp = await client.put(
-            f"{ML_API_BASE}{path}",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body,
-        )
+        for attempt in range(2):
+            token = await _token_manager.get_token()
+            resp = await client.put(
+                f"{ML_API_BASE}{path}",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=body,
+            )
+            if resp.status_code == 401 and attempt == 0 and _token_manager._refresh_token:
+                await _token_manager.force_refresh()
+                continue
+            break
     resp.raise_for_status()
     return resp.json()
 
@@ -953,14 +978,19 @@ async def mp_download_released_money_report(file_name: str) -> dict:
 from datetime import date, timedelta
 
 async def _ml_get_api(path: str, params: dict | None = None, extra_headers: dict | None = None) -> Any:
-    token = await _token_manager.get_token()
-    headers = {"Authorization": f"Bearer {token}"}
-    if extra_headers:
-        headers.update(extra_headers)
     async with httpx.AsyncClient(timeout=_ML_TIMEOUT) as client:
-        resp = await client.get(f"{ML_API_BASE}{path}", headers=headers, params=params or {})
-        resp.raise_for_status()
-        return resp.json()
+        for attempt in range(2):
+            token = await _token_manager.get_token()
+            headers = {"Authorization": f"Bearer {token}"}
+            if extra_headers:
+                headers.update(extra_headers)
+            resp = await client.get(f"{ML_API_BASE}{path}", headers=headers, params=params or {})
+            if resp.status_code == 401 and attempt == 0 and _token_manager._refresh_token:
+                await _token_manager.force_refresh()
+                continue
+            break
+    resp.raise_for_status()
+    return resp.json()
 
 @mcp.tool()
 async def ml_list_product_ads_campaigns(
