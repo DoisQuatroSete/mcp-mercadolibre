@@ -46,7 +46,29 @@ MP_AUTH_BASE          = "https://auth.mercadopago.com"
 MP_API_BASE           = "https://api.mercadopago.com"
 MP_TOKEN_URL          = f"{MP_API_BASE}/oauth/token"
 _MP_TIMEOUT           = httpx.Timeout(30.0)
-_mp_oauth_state: Optional[str] = None
+
+
+def _make_mp_state() -> str:
+    """Cria um state assinado, sem depender da memória/replica do Railway."""
+    payload = f"{int(time.time())}:{secrets.token_urlsafe(18)}"
+    key = (BEARER_TOKEN or MP_CLIENT_SECRET).encode()
+    signature = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
+    raw = f"{payload}:{signature}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _verify_mp_state(state: str) -> bool:
+    try:
+        raw = base64.urlsafe_b64decode(state + "=" * (-len(state) % 4)).decode()
+        timestamp, nonce, signature = raw.split(":", 2)
+        payload = f"{timestamp}:{nonce}"
+        if int(time.time()) - int(timestamp) > 900:
+            return False
+        key = (BEARER_TOKEN or MP_CLIENT_SECRET).encode()
+        expected = hmac.new(key, payload.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(signature, expected)
+    except Exception:
+        return False
 
 # Se aplica a cada llamada saliente a la API de ML — evita que los workers queden colgados
 # cuando ML está lento o no responde.
@@ -998,12 +1020,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return JSONResponse({"error": "Too many requests"}, status_code=429)
 
         # OAuth separado do Mercado Pago Brasil.
-        global _mp_oauth_state
         if path == "/mp/auth/url":
             if not MP_CLIENT_ID or not MP_REDIRECT_URI:
                 return JSONResponse({"error": "MP_CLIENT_ID and MP_REDIRECT_URI must be set"}, status_code=500)
-            _mp_oauth_state = secrets.token_urlsafe(24)
-            params = urlencode({"response_type": "code", "client_id": MP_CLIENT_ID, "platform_id": "mp", "state": _mp_oauth_state, "redirect_uri": MP_REDIRECT_URI})
+            state = _make_mp_state()
+            params = urlencode({"response_type": "code", "client_id": MP_CLIENT_ID, "platform_id": "mp", "state": state, "redirect_uri": MP_REDIRECT_URI})
             return JSONResponse({"auth_url": f"{MP_AUTH_BASE}/authorization?{params}", "redirect_uri": MP_REDIRECT_URI})
 
         if path == "/mp/auth/callback":
@@ -1011,7 +1032,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             state = request.query_params.get("state", "")
             if not code:
                 return HTMLResponse("Missing code parameter", status_code=400)
-            if _mp_oauth_state and state != _mp_oauth_state:
+            if not _verify_mp_state(state):
                 return HTMLResponse("Invalid OAuth state", status_code=400)
             if not MP_CLIENT_ID or not MP_CLIENT_SECRET or not MP_REDIRECT_URI:
                 return HTMLResponse("Mercado Pago OAuth is not configured in Railway", status_code=500)
@@ -1023,7 +1044,6 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                     return HTMLResponse(f"<h2>Mercado Pago OAuth failed (HTTP {resp.status_code})</h2><p>Check Railway logs.</p>", status_code=502)
                 data = resp.json()
                 _mp_token_manager.set_tokens(data.get("access_token", ""), data.get("refresh_token", ""), data.get("expires_in", 21600))
-                _mp_oauth_state = None
                 logger.warning("Mercado Pago OAuth complete. Configure MP_ACCESS_TOKEN and MP_REFRESH_TOKEN securely in Railway; token values are not printed.")
                 return HTMLResponse("<h2>Mercado Pago authorization complete.</h2><p>The token is active for this process. Save the returned credentials securely in Railway before restarting.</p>")
             except Exception as e:
