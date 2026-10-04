@@ -1022,7 +1022,9 @@ async def ml_list_product_ads_campaigns(
         if not advertisers:
             return {"advertisers": [], "campaigns": [], "message": "Nenhum anunciante Product Ads encontrado."}
 
-        advertiser_id = advertisers[0].get("id") or advertisers[0].get("advertiser_id")
+        advertiser = advertisers[0]
+        advertiser_id = advertiser.get("id") or advertiser.get("advertiser_id")
+        advertiser_site_id = advertiser.get("site_id") or ML_SITE
         if not advertiser_id:
             return {"error": "O Mercado Livre não retornou um advertiser_id."}
 
@@ -1039,13 +1041,14 @@ async def ml_list_product_ads_campaigns(
         }
 
         campaigns = await _ml_get_api(
-            f"/advertising/advertisers/{advertiser_id}/product_ads/campaigns/search",
+            f"/advertising/{advertiser_site_id}/advertisers/{advertiser_id}/product_ads/campaigns/search",
             params,
             {"Api-Version": "2"},
         )
 
         return {
             "advertiser_id": advertiser_id,
+            "advertiser_site_id": advertiser_site_id,
             "date_from": date_from,
             "date_to": date_to,
             "campaigns": campaigns,
