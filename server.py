@@ -7,6 +7,7 @@ import time
 import asyncio
 import secrets
 from collections import deque
+from datetime import date, datetime, timedelta
 from typing import Optional, Any
 from urllib.parse import urlencode
 
@@ -910,6 +911,318 @@ async def mp_search_payments(
         return await _mp_get("/v1/payments/search", params)
     except Exception as e:
         return _error(str(e), "Failed to search Mercado Pago payments")
+
+
+def _money(value: Any) -> float:
+    try:
+        return round(float(value or 0) + 1e-9, 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def _find_flex_bonus(shipment_id: str, order_created: str) -> list[dict]:
+    """Finds the separate Mercado Pago cashback movement for a Flex shipment."""
+    if not shipment_id:
+        return []
+    try:
+        day = datetime.fromisoformat(order_created.replace("Z", "+00:00"))
+        begin = (day - timedelta(days=3)).strftime("%Y-%m-%dT00:00:00Z")
+        end = (day + timedelta(days=5)).strftime("%Y-%m-%dT23:59:59Z")
+    except ValueError:
+        begin, end = "NOW-30DAYS", "NOW"
+
+    results: list[dict] = []
+    offset = 0
+    while offset < 1000:
+        raw = await _mp_get("/v1/payments/search", {
+            "sort": "date_created",
+            "criteria": "desc",
+            "range": "date_created",
+            "begin_date": begin,
+            "end_date": end,
+            "limit": 50,
+            "offset": offset,
+        })
+        page = raw.get("results", []) or []
+        results.extend(page)
+        if len(page) < 50:
+            break
+        offset += 50
+    matches = []
+    for item in results:
+        if item.get("description") != "bonificaciones_flex":
+            continue
+        tx = ((item.get("point_of_interaction") or {}).get("transaction_data") or {})
+        if str(tx.get("reference_id", "")) != str(shipment_id):
+            continue
+        matches.append({
+            "payment_id": str(item.get("id", "")),
+            "description": item.get("description"),
+            "amount": _money((item.get("transaction_details") or {}).get(
+                "net_received_amount", item.get("transaction_amount")
+            )),
+            "status": item.get("status"),
+            "release_status": item.get("money_release_status"),
+            "release_date": item.get("money_release_date"),
+            "external_reference": item.get("external_reference"),
+            "shipment_id": str(shipment_id),
+        })
+    return matches
+
+
+@mcp.tool()
+async def ml_simulate_sale_reconciliation(order_id: str) -> dict:
+    """
+    Simula a conciliação de uma venda sem conectar ou alterar o Olist.
+
+    Retorna o valor bruto da venda, taxas e outros movimentos do Mercado Pago,
+    logística, bônus Flex e a proposta de uma única conta a receber no Olist.
+    Nenhum lançamento é criado ou baixado.
+    """
+    if not _RE_NUMERIC_ID.match(str(order_id)):
+        return {"error": "order_id must contain digits only"}
+    try:
+        order = await _ml_get(f"/orders/{order_id}")
+        payments = order.get("payments", []) or []
+        if not payments:
+            return {"error": "A venda não possui pagamento associado", "order_id": order_id}
+
+        payment_id = str(payments[0].get("id", ""))
+        payment = await _mp_get(f"/v1/payments/{payment_id}")
+        shipment_id = str((order.get("shipping") or {}).get("id", ""))
+        shipment = await _ml_get(f"/shipments/{shipment_id}") if shipment_id else {}
+        logistic = shipment.get("logistic") or {}
+        logistic_type = logistic.get("type") or shipment.get("logistic_type")
+        shipping_mode = logistic.get("mode") or shipment.get("mode")
+        is_flex = logistic_type == "self_service"
+
+        charges = []
+        seller_deductions = 0.0
+        seller_credits = 0.0
+        for charge in payment.get("charges_details", []) or []:
+            amounts = charge.get("amounts") or {}
+            amount = _money(_money(amounts.get("original")) - _money(amounts.get("refunded")))
+            if not amount:
+                continue
+            accounts = charge.get("accounts") or {}
+            src, dst = str(accounts.get("from", "")), str(accounts.get("to", ""))
+            if src == "collector":
+                direction, signed = "saida", -amount
+                seller_deductions += amount
+            elif dst == "collector":
+                direction, signed = "entrada", amount
+                seller_credits += amount
+            else:
+                # Ex.: cupom pago pelo Mercado Livre ao comprador; não mexe no caixa do vendedor.
+                direction, signed = "informativo", 0.0
+            kind = charge.get("type") or "other"
+            name = charge.get("name") or kind
+            charges.append({
+                "name": name,
+                "type": kind,
+                "direction": direction,
+                "amount": amount,
+                "signed_amount": signed,
+                "shipment_id": (charge.get("metadata") or {}).get("shipment_id"),
+            })
+
+        bonuses = await _find_flex_bonus(
+            shipment_id, str(order.get("date_created", ""))
+        ) if is_flex else []
+        confirmed_bonus = sum(
+            row["amount"] for row in bonuses if row.get("release_status") == "released"
+        )
+        pending_bonus = sum(
+            row["amount"] for row in bonuses if row.get("release_status") != "released"
+        )
+
+        gross = _money(order.get("total_amount") or order.get("paid_amount"))
+        net_received = _money(
+            (payment.get("transaction_details") or {}).get("net_received_amount")
+        )
+        tx_amount = _money(payment.get("transaction_amount"))
+        buyer_shipping = _money(payment.get("shipping_amount"))
+        refunded = _money(payment.get("transaction_amount_refunded"))
+        expected_net = _money(tx_amount + buyer_shipping - refunded - seller_deductions + seller_credits)
+        difference = _money(net_received - expected_net)
+
+        alerts = []
+        if len(payments) > 1:
+            alerts.append("Venda com mais de um pagamento: revisar manualmente.")
+        if order.get("pack_id"):
+            try:
+                pack = await _ml_get(f"/packs/{order.get('pack_id')}")
+                if len(pack.get("orders", []) or []) > 1:
+                    alerts.append("Venda em carrinho com outros pedidos: frete e bônus podem ser compartilhados.")
+            except Exception:
+                pass
+        if refunded:
+            alerts.append("Pagamento com reembolso/devolução.")
+        if buyer_shipping:
+            alerts.append("Comprador pagou frete; valor entra no recebido.")
+        if payment.get("status") != "approved":
+            alerts.append(f"Pagamento não aprovado: {payment.get('status')}.")
+        if abs(tx_amount - gross) > 0.01:
+            alerts.append("Valor do pagamento diferente do valor da venda.")
+        if abs(difference) > 0.01:
+            alerts.append("Conta não fecha: líquido do Mercado Pago diferente do calculado.")
+        if is_flex and not bonuses:
+            alerts.append("Venda Flex sem bônus encontrado (ainda não creditado ou sem bônus).")
+        can_post = (
+            not any(a.startswith(("Conta não fecha", "Pagamento não aprovado", "Venda com mais", "Valor do pagamento")) for a in alerts)
+            and payment.get("money_release_status") == "released"
+        )
+        return {
+            "mode": "simulation_only",
+            "writes_performed": False,
+            "order": {
+                "id": str(order_id),
+                "gross_sale": gross,
+                "currency": order.get("currency_id", "BRL"),
+                "status": order.get("status"),
+                "date_created": order.get("date_created"),
+                "item_titles": [
+                    (line.get("item") or {}).get("title")
+                    for line in order.get("order_items", []) or []
+                ],
+            },
+            "payment": {
+                "id": payment_id,
+                "transaction_amount": _money(payment.get("transaction_amount")),
+                "net_received_amount": net_received,
+                "total_paid_amount": _money(
+                    (payment.get("transaction_details") or {}).get("total_paid_amount")
+                ),
+                "release_status": payment.get("money_release_status"),
+                "release_date": payment.get("money_release_date"),
+            },
+            "logistics": {
+                "shipment_id": shipment_id,
+                "logistic_type": logistic_type,
+                "mode": shipping_mode,
+                "is_flex": is_flex,
+            },
+            "sale_adjustments": {
+                "charges": charges,
+                "charges_total": round(seller_deductions, 2),
+                "credits_total": round(seller_credits, 2),
+                "buyer_paid_shipping": buyer_shipping,
+                "refunded": refunded,
+                "flex_bonuses": bonuses,
+                "flex_bonus_confirmed": round(confirmed_bonus, 2),
+                "flex_bonus_pending": round(pending_bonus, 2),
+            },
+            "proposed_olist": {
+                "one_accounts_receivable": {
+                    "value": gross,
+                    "category": "Mercado Livre",
+                    "history": f"Venda Mercado Livre {order_id}",
+                },
+                "one_receipt": {
+                    "value": _money(net_received + confirmed_bonus),
+                    "taxas_e_outros": _money(gross - net_received - confirmed_bonus),
+                    "category": "Taxas e outros - Mercado Livre",
+                    "fees_and_other": charges + [
+                        {"name": "bonificaciones_flex", "type": "flex_bonus",
+                         "direction": "entrada", "amount": b["amount"],
+                         "signed_amount": b["amount"], "payment_id": b["payment_id"],
+                         "release_status": b["release_status"]}
+                        for b in bonuses
+                    ],
+                    "history": (
+                        f"Conciliação da venda {order_id}; "
+                        f"MP {payment_id}; shipment {shipment_id}"
+                    ),
+                },
+                "ads": "Fora desta venda; lançar separadamente por dia.",
+            },
+            "check": {
+                "expected_net": expected_net,
+                "mercado_pago_net": net_received,
+                "difference": difference,
+                "closes": abs(difference) <= 0.01,
+                "alerts": alerts,
+                "ready_for_olist": can_post,
+                "ready_reason": (
+                    "ok" if can_post else
+                    "aguardando liberação do dinheiro" if not alerts or all(
+                        a.startswith(("Venda em carrinho", "Comprador pagou", "Venda Flex sem", "Pagamento com reembolso")) for a in alerts
+                    ) else "divergência: vira tarefa no ClickUp"
+                ),
+            },
+            "marketplace_view": {
+                "confirmed_cash_from_sale": net_received,
+                "confirmed_flex_bonus": round(confirmed_bonus, 2),
+                "pending_flex_bonus": round(pending_bonus, 2),
+                "confirmed_total_from_marketplace": round(
+                    net_received + confirmed_bonus, 2
+                ),
+                "expected_total_after_pending_bonus": round(
+                    net_received + confirmed_bonus + pending_bonus, 2
+                ),
+            },
+        }
+    except Exception as e:
+        return _error(str(e), "Failed to simulate sale reconciliation")
+
+
+@mcp.tool()
+async def ml_get_ads_daily(date_value: Optional[str] = None) -> dict:
+    """Consulta o gasto diário de Product Ads, sem criar lançamento."""
+    try:
+        target = date_value or (date.today() - timedelta(days=1)).isoformat()
+        date.fromisoformat(target)
+        advertisers_raw = await _ml_get_api(
+            "/advertising/advertisers",
+            {"product_id": "PADS"},
+            {"Api-Version": "2"},
+        )
+        advertisers = (
+            advertisers_raw if isinstance(advertisers_raw, list)
+            else advertisers_raw.get("advertisers", advertisers_raw.get("results", []))
+        )
+        if not advertisers:
+            return {"mode": "simulation_only", "date": target, "cost": 0.0, "campaigns": []}
+        advertiser = advertisers[0]
+        advertiser_id = advertiser.get("id") or advertiser.get("advertiser_id")
+        site_id = advertiser.get("site_id") or ML_SITE
+        data = await _ml_get_api(
+            f"/advertising/{site_id}/advertisers/{advertiser_id}/product_ads/campaigns/search",
+            {
+                "limit": 50,
+                "offset": 0,
+                "date_from": target,
+                "date_to": target,
+                "metrics": "clicks,prints,ctr,cost,cpc,acos,cvr,roas,units_quantity,total_amount",
+                "metrics_summary": "true",
+            },
+            {"Api-Version": "2"},
+        )
+        summary = (data or {}).get("metrics_summary") or {}
+        total_cost = _money(summary.get("cost"))
+        if not total_cost:
+            total_cost = _money(sum(
+                float(((c.get("metrics") or {}).get("cost")) or 0)
+                for c in (data or {}).get("results", []) or []
+            ))
+        return {
+            "mode": "simulation_only",
+            "writes_performed": False,
+            "date": target,
+            "category": "Publicidade/Ads - Mercado Livre",
+            "total_cost": total_cost,
+            "proposed_olist": {
+                "accounts_payable": {
+                    "value": total_cost,
+                    "category": "Publicidade/Ads - Mercado Livre",
+                    "history": f"Product Ads Mercado Livre {target}",
+                }
+            } if total_cost else None,
+            "campaigns": data,
+            "instruction": "O lançamento diário só será criado depois da conexão com o Olist.",
+        }
+    except Exception as e:
+        return _error(str(e), "Failed to get daily Product Ads")
 
 async def _mp_generate_report(report_type: str, begin_date: str, end_date: str) -> dict:
     if report_type not in {"settlement", "release"}:
