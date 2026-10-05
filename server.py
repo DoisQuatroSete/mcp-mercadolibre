@@ -1506,7 +1506,7 @@ async def olist_update_account_receivable(
     if competency:
         payload["dataCompetencia"] = competency
     if taxa is not None:
-        payload["taxa"] = round(float(taxa), 2)
+        payload["taxa"] = f"{float(taxa):.2f}"
     if not payload:
         return {"error": "Informe ao menos due_date, category_id, competency ou taxa"}
     preview = {"method": "PUT", "path": f"/contas-receber/{account_id}", "payload": payload, "executed": False}
