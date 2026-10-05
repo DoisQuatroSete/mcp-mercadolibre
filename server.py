@@ -267,15 +267,12 @@ _mp_token_manager = MPTokenManager(TOKEN_REFRESH_BUFFER)
 
 
 class OlistTokenManager:
-    """Mantém o token Olist e renova com refresh token; não possui métodos de escrita."""
+    """Mantém o token Olist e renova com refresh token para leitura e escrita controladas."""
     def __init__(self, refresh_buffer: int = 300):
         self._refresh_buffer = refresh_buffer
         self._access_token = os.environ.get("OLIST_ACCESS_TOKEN", "")
         self._refresh_token = os.environ.get("OLIST_REFRESH_TOKEN", "")
-        # Tokens from Railway do not carry their original expiry timestamp.
-        # Olist access tokens last four hours, so assume that lifetime here;
-        # the refresh path still takes over when the API returns 401.
-        self._expires_at = time.monotonic() + 14400 if self._access_token else 0.0
+        self._expires_at = time.monotonic() + 60 if self._access_token else 0.0
         self._lock = asyncio.Lock()
 
     def set_tokens(self, access_token: str, refresh_token: str, expires_in: int = 14400) -> None:
@@ -329,6 +326,40 @@ async def _olist_get(path: str, params: dict | None = None) -> Any:
             )
     resp.raise_for_status()
     return resp.json()
+
+
+async def _olist_write(method: str, path: str, payload: dict | None = None) -> Any:
+    """Executa uma operação de escrita no Olist, com retry seguro após 401."""
+    token = await _olist_token_manager.get_token()
+    async with httpx.AsyncClient(timeout=_OLIST_TIMEOUT) as client:
+        resp = await client.request(
+            method,
+            f"{OLIST_API_BASE}{path}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json=payload or {},
+        )
+        if resp.status_code == 401:
+            _olist_token_manager._expires_at = 0.0
+            token = await _olist_token_manager.get_token()
+            resp = await client.request(
+                method,
+                f"{OLIST_API_BASE}{path}",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                },
+                json=payload or {},
+            )
+    if resp.status_code == 204:
+        return {"status": "ok", "http_status": 204}
+    resp.raise_for_status()
+    return resp.json() if resp.content else {"status": "ok", "http_status": resp.status_code}
+
 
 async def _mp_get(path: str, params: dict | None = None) -> Any:
     token = await _mp_token_manager.get_token()
@@ -1391,7 +1422,7 @@ async def olist_get_authorization_url() -> dict:
     return {
         "authorization_url": _olist_authorization_url(state),
         "redirect_uri": OLIST_REDIRECT_URI,
-        "permissions": "somente leitura",
+        "permissions": "leitura e escrita controlada; exclusão não implementada",
     }
 
 
@@ -1449,6 +1480,84 @@ async def olist_get_account_receipts(account_id: str) -> dict:
         return {"receipts": await _olist_get(f"/contas-receber/{account_id}/recebimentos")}
     except Exception as e:
         return _error(str(e), "Failed to get Olist account receipts")
+
+
+@mcp.tool()
+async def olist_update_account_receivable(
+    account_id: str,
+    due_date: Optional[str] = None,
+    category_id: Optional[str] = None,
+    competency: Optional[str] = None,
+    execute: bool = False,
+) -> dict:
+    """Atualiza uma conta a receber. Por segurança, execute=False apenas simula."""
+    if not _RE_NUMERIC_ID.match(str(account_id)):
+        return {"error": "account_id must contain digits only"}
+    payload: dict[str, Any] = {}
+    if due_date:
+        payload["dataVencimento"] = due_date
+    if category_id:
+        if not _RE_NUMERIC_ID.match(str(category_id)):
+            return {"error": "category_id must contain digits only"}
+        payload["categoria"] = {"id": int(category_id)}
+    if competency:
+        payload["dataCompetencia"] = competency
+    if not payload:
+        return {"error": "Informe ao menos due_date, category_id ou competency"}
+    preview = {"method": "PUT", "path": f"/contas-receber/{account_id}", "payload": payload, "executed": False}
+    if not execute:
+        return {"mode": "simulation_only", **preview}
+    try:
+        return {"mode": "executed", **preview, "result": await _olist_write("PUT", f"/contas-receber/{account_id}", payload)}
+    except Exception as e:
+        return _error(str(e), "Failed to update Olist account receivable")
+
+
+@mcp.tool()
+async def olist_baixar_conta_receber(
+    account_id: str,
+    valor_pago: float,
+    data: Optional[str] = None,
+    conta_destino_id: Optional[str] = None,
+    categoria_id: Optional[str] = None,
+    taxa: float = 0.0,
+    juros: float = 0.0,
+    desconto: float = 0.0,
+    acrescimo: float = 0.0,
+    historico: Optional[str] = None,
+    execute: bool = False,
+) -> dict:
+    """Baixa uma conta a receber; execute=False gera prévia e não altera o Olist."""
+    if not _RE_NUMERIC_ID.match(str(account_id)):
+        return {"error": "account_id must contain digits only"}
+    if valor_pago < 0 or any(v < 0 for v in (taxa, juros, desconto, acrescimo)):
+        return {"error": "Valores financeiros não podem ser negativos"}
+    payload: dict[str, Any] = {
+        "valorPago": round(float(valor_pago), 2),
+        "taxa": round(float(taxa), 2),
+        "juros": round(float(juros), 2),
+        "desconto": round(float(desconto), 2),
+        "acrescimo": round(float(acrescimo), 2),
+    }
+    if data:
+        payload["data"] = data
+    if conta_destino_id:
+        if not _RE_NUMERIC_ID.match(str(conta_destino_id)):
+            return {"error": "conta_destino_id must contain digits only"}
+        payload["contaDestino"] = {"id": int(conta_destino_id)}
+    if categoria_id:
+        if not _RE_NUMERIC_ID.match(str(categoria_id)):
+            return {"error": "categoria_id must contain digits only"}
+        payload["categoria"] = {"id": int(categoria_id)}
+    if historico:
+        payload["historico"] = historico[:300]
+    preview = {"method": "POST", "path": f"/contas-receber/{account_id}/baixar", "payload": payload, "executed": False}
+    if not execute:
+        return {"mode": "simulation_only", **preview}
+    try:
+        return {"mode": "executed", **preview, "result": await _olist_write("POST", f"/contas-receber/{account_id}/baixar", payload)}
+    except Exception as e:
+        return _error(str(e), "Failed to settle Olist account receivable")
 
 
 @mcp.tool()
