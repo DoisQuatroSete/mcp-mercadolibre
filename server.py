@@ -331,10 +331,11 @@ async def _olist_get(path: str, params: dict | None = None) -> Any:
 async def _olist_write(method: str, path: str, payload: dict | None = None) -> Any:
     """Executa uma operação de escrita no Olist, com retry seguro após 401."""
     token = await _olist_token_manager.get_token()
+    request_url = f"{OLIST_API_BASE}{path}"
     async with httpx.AsyncClient(timeout=_OLIST_TIMEOUT) as client:
         resp = await client.request(
             method,
-            f"{OLIST_API_BASE}{path}",
+            request_url,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/json",
@@ -347,7 +348,7 @@ async def _olist_write(method: str, path: str, payload: dict | None = None) -> A
             token = await _olist_token_manager.get_token()
             resp = await client.request(
                 method,
-                f"{OLIST_API_BASE}{path}",
+                request_url,
                 headers={
                     "Authorization": f"Bearer {token}",
                     "Accept": "application/json",
@@ -357,7 +358,11 @@ async def _olist_write(method: str, path: str, payload: dict | None = None) -> A
             )
     if resp.status_code == 204:
         return {"status": "ok", "http_status": 204}
-    resp.raise_for_status()
+    if resp.is_error:
+        body = resp.text[:2000]
+        raise RuntimeError(
+            f"Olist API HTTP {resp.status_code} on {method} {path}: {body}"
+        )
     return resp.json() if resp.content else {"status": "ok", "http_status": resp.status_code}
 
 
@@ -1515,7 +1520,13 @@ async def olist_update_account_receivable(
     try:
         return {"mode": "executed", **preview, "result": await _olist_write("PUT", f"/contas-receber/{account_id}", payload)}
     except Exception as e:
-        return _error(str(e), "Failed to update Olist account receivable")
+        logger.exception("olist_update_account_receivable failed")
+        return {
+            "error": "Failed to update Olist account receivable",
+            "detail": str(e),
+            "account_id": str(account_id),
+            "payload": payload,
+        }
 
 
 @mcp.tool()
@@ -1562,7 +1573,13 @@ async def olist_baixar_conta_receber(
     try:
         return {"mode": "executed", **preview, "result": await _olist_write("POST", f"/contas-receber/{account_id}/baixar", payload)}
     except Exception as e:
-        return _error(str(e), "Failed to settle Olist account receivable")
+        logger.exception("olist_baixar_conta_receber failed")
+        return {
+            "error": "Failed to settle Olist account receivable",
+            "detail": str(e),
+            "account_id": str(account_id),
+            "payload": payload,
+        }
 
 
 @mcp.tool()
