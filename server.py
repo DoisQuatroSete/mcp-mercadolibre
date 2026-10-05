@@ -1488,11 +1488,14 @@ async def olist_update_account_receivable(
     due_date: Optional[str] = None,
     category_id: Optional[str] = None,
     competency: Optional[str] = None,
+    taxa: Optional[float] = None,
     execute: bool = False,
 ) -> dict:
     """Atualiza uma conta a receber. Por segurança, execute=False apenas simula."""
     if not _RE_NUMERIC_ID.match(str(account_id)):
         return {"error": "account_id must contain digits only"}
+    if taxa is not None and taxa < 0:
+        return {"error": "taxa não pode ser negativa"}
     payload: dict[str, Any] = {}
     if due_date:
         payload["dataVencimento"] = due_date
@@ -1502,8 +1505,10 @@ async def olist_update_account_receivable(
         payload["categoria"] = {"id": int(category_id)}
     if competency:
         payload["dataCompetencia"] = competency
+    if taxa is not None:
+        payload["taxa"] = round(float(taxa), 2)
     if not payload:
-        return {"error": "Informe ao menos due_date, category_id ou competency"}
+        return {"error": "Informe ao menos due_date, category_id, competency ou taxa"}
     preview = {"method": "PUT", "path": f"/contas-receber/{account_id}", "payload": payload, "executed": False}
     if not execute:
         return {"mode": "simulation_only", **preview}
