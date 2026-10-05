@@ -1583,6 +1583,49 @@ async def olist_baixar_conta_receber(
 
 
 @mcp.tool()
+async def olist_estornar_contas_pedido(
+    pedido_id: str,
+    execute: bool = False,
+) -> dict:
+    """Estorna as contas a receber originadas por um pedido de venda.
+
+    O endpoint oficial do Olist para esse fluxo é:
+    POST /pedidos/{idPedido}/estornar-contas
+
+    execute=False apenas gera a prévia e não altera o Olist.
+    """
+    if not _RE_NUMERIC_ID.match(str(pedido_id)):
+        return {"error": "pedido_id must contain digits only"}
+
+    preview = {
+        "method": "POST",
+        "path": f"/pedidos/{pedido_id}/estornar-contas",
+        "payload": {},
+        "executed": False,
+    }
+    if not execute:
+        return {"mode": "simulation_only", **preview}
+
+    try:
+        return {
+            "mode": "executed",
+            **preview,
+            "result": await _olist_write(
+                "POST",
+                f"/pedidos/{pedido_id}/estornar-contas",
+                {},
+            ),
+        }
+    except Exception as e:
+        logger.exception("olist_estornar_contas_pedido failed")
+        return {
+            "error": "Failed to reverse Olist receivables from order",
+            "detail": str(e),
+            "pedido_id": str(pedido_id),
+        }
+
+
+@mcp.tool()
 async def olist_list_categories() -> dict:
     """Lista categorias de receitas e despesas do Olist; somente leitura."""
     try:
