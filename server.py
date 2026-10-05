@@ -50,6 +50,18 @@ MP_ACCESS_TOKEN = os.environ.get("MP_ACCESS_TOKEN", "")
 MP_REFRESH_TOKEN = os.environ.get("MP_REFRESH_TOKEN", "")
 _MP_TIMEOUT = httpx.Timeout(30.0)
 
+# Olist ERP V3: OAuth2 somente leitura nesta etapa.
+OLIST_CLIENT_ID = os.environ.get("OLIST_CLIENT_ID", "")
+OLIST_CLIENT_SECRET = os.environ.get("OLIST_CLIENT_SECRET", "")
+OLIST_REDIRECT_URI = os.environ.get(
+    "OLIST_REDIRECT_URI",
+    "https://mcp-mercadolibre-production-43c5.up.railway.app/olist/callback",
+)
+OLIST_AUTH_URL = "https://accounts.tiny.com.br/realms/tiny/protocol/openid-connect/auth"
+OLIST_TOKEN_URL = "https://accounts.tiny.com.br/realms/tiny/protocol/openid-connect/token"
+OLIST_API_BASE = "https://api.tiny.com.br/public-api/v3"
+_OLIST_TIMEOUT = httpx.Timeout(30.0)
+
 # Se aplica a cada llamada saliente a la API de ML — evita que los workers queden colgados
 # cuando ML está lento o no responde.
 _ML_TIMEOUT = httpx.Timeout(30.0)
@@ -252,6 +264,71 @@ class MPTokenManager:
         self.set_tokens(data.get("access_token", ""), data.get("refresh_token", ""), data.get("expires_in", 21600))
 
 _mp_token_manager = MPTokenManager(TOKEN_REFRESH_BUFFER)
+
+
+class OlistTokenManager:
+    """Mantém o token Olist e renova com refresh token; não possui métodos de escrita."""
+    def __init__(self, refresh_buffer: int = 300):
+        self._refresh_buffer = refresh_buffer
+        self._access_token = os.environ.get("OLIST_ACCESS_TOKEN", "")
+        self._refresh_token = os.environ.get("OLIST_REFRESH_TOKEN", "")
+        # Tokens from Railway do not carry their original expiry timestamp.
+        # Olist access tokens last four hours, so assume that lifetime here;
+        # the refresh path still takes over when the API returns 401.
+        self._expires_at = time.monotonic() + 14400 if self._access_token else 0.0
+        self._lock = asyncio.Lock()
+
+    def set_tokens(self, access_token: str, refresh_token: str, expires_in: int = 14400) -> None:
+        if not access_token:
+            raise RuntimeError("Olist não retornou access_token")
+        self._access_token = access_token
+        if refresh_token:
+            self._refresh_token = refresh_token
+        self._expires_at = time.monotonic() + max(int(expires_in or 14400), 60)
+
+    async def get_token(self) -> str:
+        if self._access_token and time.monotonic() < self._expires_at - self._refresh_buffer:
+            return self._access_token
+        async with self._lock:
+            if self._access_token and time.monotonic() < self._expires_at - self._refresh_buffer:
+                return self._access_token
+            if not self._refresh_token:
+                raise RuntimeError("Olist ainda não autorizado; abra /olist/auth")
+            async with httpx.AsyncClient(timeout=_OLIST_TIMEOUT) as client:
+                resp = await client.post(OLIST_TOKEN_URL, data={
+                    "grant_type": "refresh_token",
+                    "client_id": OLIST_CLIENT_ID,
+                    "client_secret": OLIST_CLIENT_SECRET,
+                    "refresh_token": self._refresh_token,
+                })
+            if resp.status_code != 200:
+                raise RuntimeError(f"Olist refresh token HTTP {resp.status_code}")
+            data = resp.json()
+            self.set_tokens(data.get("access_token", ""), data.get("refresh_token", ""), data.get("expires_in", 14400))
+            return self._access_token
+
+_olist_token_manager = OlistTokenManager()
+
+async def _olist_get(path: str, params: dict | None = None) -> Any:
+    token = await _olist_token_manager.get_token()
+    async with httpx.AsyncClient(timeout=_OLIST_TIMEOUT) as client:
+        resp = await client.get(
+            f"{OLIST_API_BASE}{path}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            params=params or {},
+        )
+    if resp.status_code == 401:
+        # Força o próximo chamado a usar refresh token.
+        _olist_token_manager._expires_at = 0.0
+        token = await _olist_token_manager.get_token()
+        async with httpx.AsyncClient(timeout=_OLIST_TIMEOUT) as client:
+            resp = await client.get(
+                f"{OLIST_API_BASE}{path}",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                params=params or {},
+            )
+    resp.raise_for_status()
+    return resp.json()
 
 async def _mp_get(path: str, params: dict | None = None) -> Any:
     token = await _mp_token_manager.get_token()
@@ -1286,6 +1363,104 @@ async def mp_download_released_money_report(file_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Olist ERP: autorização e consultas somente leitura
+# ---------------------------------------------------------------------------
+
+_olist_states: dict[str, float] = {}
+
+
+def _olist_authorization_url(state: str) -> str:
+    return (
+        f"{OLIST_AUTH_URL}?" + urlencode({
+            "client_id": OLIST_CLIENT_ID,
+            "redirect_uri": OLIST_REDIRECT_URI,
+            "scope": "openid",
+            "response_type": "code",
+            "state": state,
+        })
+    )
+
+
+@mcp.tool()
+async def olist_get_authorization_url() -> dict:
+    """Gera o link para autorizar o Olist; não altera nenhum dado do ERP."""
+    if not OLIST_CLIENT_ID or not OLIST_CLIENT_SECRET:
+        return {"error": "Configure OLIST_CLIENT_ID e OLIST_CLIENT_SECRET no Railway."}
+    state = secrets.token_urlsafe(32)
+    _olist_states[state] = time.time()
+    return {
+        "authorization_url": _olist_authorization_url(state),
+        "redirect_uri": OLIST_REDIRECT_URI,
+        "permissions": "somente leitura",
+    }
+
+
+@mcp.tool()
+async def olist_get_info() -> dict:
+    """Lê as informações da empresa conectada ao Olist."""
+    try:
+        return await _olist_get("/info")
+    except Exception as e:
+        return _error(str(e), "Failed to get Olist account info")
+
+
+@mcp.tool()
+async def olist_list_accounts_receivable(
+    situation: Optional[str] = None,
+    document_number: Optional[str] = None,
+    sale_id: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> dict:
+    """Lista Contas a Receber do Olist; somente leitura."""
+    try:
+        params: dict[str, Any] = {
+            "limit": min(max(limit, 1), 100),
+            "offset": max(offset, 0),
+        }
+        if situation:
+            params["situacao"] = situation
+        if document_number:
+            params["numeroDocumento"] = document_number
+        if sale_id:
+            params["idVenda"] = sale_id
+        return await _olist_get("/contas-receber", params)
+    except Exception as e:
+        return _error(str(e), "Failed to list Olist accounts receivable")
+
+
+@mcp.tool()
+async def olist_get_account_receivable(account_id: str) -> dict:
+    """Lê uma Conta a Receber detalhada do Olist; somente leitura."""
+    if not _RE_NUMERIC_ID.match(str(account_id)):
+        return {"error": "account_id must contain digits only"}
+    try:
+        return await _olist_get(f"/contas-receber/{account_id}")
+    except Exception as e:
+        return _error(str(e), "Failed to get Olist account receivable")
+
+
+@mcp.tool()
+async def olist_get_account_receipts(account_id: str) -> dict:
+    """Lê os recebimentos de uma Conta a Receber do Olist; somente leitura."""
+    if not _RE_NUMERIC_ID.match(str(account_id)):
+        return {"error": "account_id must contain digits only"}
+    try:
+        return {"receipts": await _olist_get(f"/contas-receber/{account_id}/recebimentos")}
+    except Exception as e:
+        return _error(str(e), "Failed to get Olist account receipts")
+
+
+@mcp.tool()
+async def olist_list_categories() -> dict:
+    """Lista categorias de receitas e despesas do Olist; somente leitura."""
+    try:
+        return await _olist_get("/categorias-receita-despesa")
+    except Exception as e:
+        return _error(str(e), "Failed to list Olist categories")
+
+
+# ---------------------------------------------------------------------------
 # Middleware de autenticación
 # ---------------------------------------------------------------------------
 from datetime import date, timedelta
@@ -1391,6 +1566,47 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         # Limita la tasa en todas las rutas — las verificaciones de auth ocurren más abajo, por ruta.
         if not await _check_rate_limit(ip):
             return JSONResponse({"error": "Too many requests"}, status_code=429)
+
+        # Olist OAuth: rota pública para iniciar autorização e receber callback.
+        if path == "/olist/auth":
+            if not OLIST_CLIENT_ID or not OLIST_CLIENT_SECRET:
+                return HTMLResponse("OLIST_CLIENT_ID/SECRET não configurados", status_code=500)
+            state = secrets.token_urlsafe(32)
+            _olist_states[state] = time.time()
+            from starlette.responses import RedirectResponse
+            return RedirectResponse(_olist_authorization_url(state), status_code=302)
+
+        if path == "/olist/callback":
+            code = request.query_params.get("code", "")
+            state = request.query_params.get("state", "")
+            if not code or not state or state not in _olist_states:
+                return HTMLResponse("Autorização Olist inválida ou expirada", status_code=400)
+            if time.time() - _olist_states.pop(state) > 600:
+                return HTMLResponse("Autorização Olist expirada; abra /olist/auth novamente", status_code=400)
+            try:
+                async with httpx.AsyncClient(timeout=_OLIST_TIMEOUT) as client:
+                    resp = await client.post(OLIST_TOKEN_URL, data={
+                        "grant_type": "authorization_code",
+                        "client_id": OLIST_CLIENT_ID,
+                        "client_secret": OLIST_CLIENT_SECRET,
+                        "redirect_uri": OLIST_REDIRECT_URI,
+                        "code": code,
+                    })
+                if resp.status_code != 200:
+                    logger.error("Olist OAuth failed status=%s body=%s", resp.status_code, resp.text[:500])
+                    return HTMLResponse(f"Falha na autorização Olist (HTTP {resp.status_code})", status_code=502)
+                data = resp.json()
+                _olist_token_manager.set_tokens(
+                    data.get("access_token", ""), data.get("refresh_token", ""), data.get("expires_in", 14400)
+                )
+                logger.warning("Olist autorizado. Salve OLIST_ACCESS_TOKEN e OLIST_REFRESH_TOKEN no Railway.")
+                return HTMLResponse(
+                    "<h2>Olist autorizado.</h2><p>Agora volte ao ClickUp e rode a consulta de informações da conta. "
+                    "Nenhum lançamento foi criado ou alterado.</p>"
+                )
+            except Exception as e:
+                logger.error("Olist callback error: %s", e)
+                return HTMLResponse("Erro interno na autorização Olist.", status_code=500)
 
         # Callback de OAuth — intercambia el código de autorización por tokens.
         if path == "/auth/callback":
