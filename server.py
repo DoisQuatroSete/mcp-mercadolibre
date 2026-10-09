@@ -1634,6 +1634,264 @@ async def olist_list_categories() -> dict:
         return _error(str(e), "Failed to list Olist categories")
 
 
+
+# ---------------------------------------------------------------------------
+# Marcadores Flex no Contas a Receber do Olist
+# ---------------------------------------------------------------------------
+
+OLIST_FLEX_MARKER = "flex"
+
+
+async def _olist_flex_find_accounts_by_oc(oc: str) -> list[dict[str, Any]]:
+    """Localiza contas a receber pelo OC informado no número do documento."""
+    if not _RE_NUMERIC_ID.match(str(oc)):
+        raise ValueError("OC deve conter somente dígitos")
+
+    data = await _olist_get(
+        "/contas-receber",
+        {
+            "numeroDocumento": str(oc),
+            "limit": 100,
+            "offset": 0,
+        },
+    )
+    if isinstance(data, list):
+        return data
+    return data.get("itens", data.get("items", data.get("results", []))) or []
+
+
+async def _olist_flex_get_markers(account_id: str) -> list[dict[str, Any]]:
+    """Lê os marcadores atuais da conta a receber."""
+    data = await _olist_get(f"/contas-receber/{account_id}/marcadores")
+    if isinstance(data, list):
+        return data
+    return data.get("itens", data.get("items", data.get("results", []))) or []
+
+
+async def _olist_flex_add_marker(account_id: str, marker: str) -> Any:
+    """Adiciona um marcador sem alterar nenhum campo financeiro."""
+    return await _olist_write(
+        "POST",
+        f"/contas-receber/{account_id}/marcadores",
+        [{"descricao": marker}],
+    )
+
+
+async def _ml_flex_orders_period(
+    date_from: str,
+    date_to: str,
+    status: str = "paid",
+    max_orders: int = 10000,
+) -> list[dict[str, Any]]:
+    """Lista pedidos do período, com paginação e deduplicação por OC."""
+    user_id = await _get_user_id()
+    page_size = 50
+    offset = 0
+    orders_by_id: dict[str, dict[str, Any]] = {}
+
+    while offset < max_orders:
+        page = await _ml_get(
+            "/orders/search",
+            {
+                "seller": user_id,
+                "order.status": status,
+                "sort": "date_asc",
+                "limit": page_size,
+                "offset": offset,
+                "order.date_created.from": f"{date_from}T00:00:00.000-03:00",
+                "order.date_created.to": f"{date_to}T23:59:59.999-03:00",
+            },
+        )
+        results = page.get("results", []) or []
+        if not results:
+            break
+
+        for order in results:
+            oc = str(order.get("id", ""))
+            created = str(order.get("date_created", ""))[:10]
+            if oc and date_from <= created <= date_to:
+                orders_by_id[oc] = order
+
+        offset += len(results)
+        total = (page.get("paging") or {}).get("total")
+        if len(results) < page_size or (isinstance(total, int) and offset >= total):
+            break
+
+    return list(orders_by_id.values())
+
+
+async def _ml_flex_check_order(order: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    """Confirma Flex pelo envio, nunca pelo título ou pelo produto."""
+    shipment_id = (order.get("shipping") or {}).get("id")
+    if not shipment_id:
+        return False, {"reason": "pedido_sem_envio"}
+
+    shipment = await _ml_get(f"/shipments/{shipment_id}")
+    logistic_type = shipment.get("logistic_type")
+    return logistic_type == "self_service", {
+        "shipment_id": str(shipment_id),
+        "logistic_type": logistic_type,
+        "shipping_option": (shipment.get("shipping_option") or {}).get("name"),
+        "status": shipment.get("status"),
+    }
+
+
+@mcp.tool()
+async def olist_tag_flex_account(
+    account_id: str,
+    marker: str = OLIST_FLEX_MARKER,
+    execute: bool = False,
+) -> dict:
+    """Marca uma conta específica com flex; execute=False apenas simula."""
+    if not _RE_NUMERIC_ID.match(str(account_id)):
+        return {"error": "account_id must contain digits only"}
+    if marker.strip().lower() != OLIST_FLEX_MARKER:
+        return {"error": "Este endpoint só pode aplicar o marcador flex"}
+
+    marker = OLIST_FLEX_MARKER
+    try:
+        account = await _olist_get(f"/contas-receber/{account_id}")
+        markers_before = await _olist_flex_get_markers(str(account_id))
+        existing = {
+            str(item.get("descricao", "")).strip().lower()
+            for item in markers_before
+        }
+        already_tagged = marker in existing
+        action = "already_tagged" if already_tagged else ("would_tag" if not execute else "tagged")
+
+        if execute and not already_tagged:
+            await _olist_flex_add_marker(str(account_id), marker)
+
+        logger.info(
+            "AUDIT olist_tag_flex_account account_id=%s marker=%s execute=%s action=%s",
+            account_id,
+            marker,
+            execute,
+            action,
+        )
+        return {
+            "account_id": int(account_id),
+            "marker": marker,
+            "action": action,
+            "execute": execute,
+            "situacao": account.get("situacao"),
+            "markers_before": markers_before,
+            "financial_fields_changed": [],
+        }
+    except Exception as e:
+        logger.exception("olist_tag_flex_account failed")
+        return {"error": "Failed to tag Olist account as Flex", "detail": str(e)}
+
+
+@mcp.tool()
+async def olist_tag_flex_sales(
+    date_from: str = "2026-09-01",
+    date_to: Optional[str] = None,
+    status: str = "paid",
+    limit: int = 10000,
+    execute: bool = False,
+) -> dict:
+    """Identifica vendas Mercado Livre Flex e marca as contas correspondentes.
+
+    A venda só é considerada Flex quando o envio do Mercado Livre retorna
+    logistic_type=self_service. A conta é localizada pelo OC. O endpoint
+    altera exclusivamente o marcador flex no Contas a Receber do Olist.
+    Valor, taxa, vencimento, categoria, baixa, estorno e saldo nunca são alterados.
+    execute=False é a prévia padrão.
+    """
+    try:
+        start = date.fromisoformat(date_from)
+        end = date.fromisoformat(date_to or date.today().isoformat())
+        if end < start:
+            return {"error": "date_to deve ser igual ou posterior a date_from"}
+        if status not in {"paid", "pending", "cancelled"}:
+            return {"error": "status must be paid, pending or cancelled"}
+        if limit < 1 or limit > 10000:
+            return {"error": "limit deve estar entre 1 e 10000"}
+
+        orders = await _ml_flex_orders_period(
+            date_from,
+            end.isoformat(),
+            status=status,
+            max_orders=limit,
+        )
+        result_rows: list[dict[str, Any]] = []
+        counts = {
+            "orders_scanned": len(orders),
+            "flex_orders": 0,
+            "accounts_found": 0,
+            "accounts_tagged": 0,
+            "already_tagged": 0,
+            "missing_account": 0,
+            "not_flex": 0,
+            "errors": 0,
+        }
+
+        for order in orders:
+            oc = str(order.get("id", ""))
+            row: dict[str, Any] = {
+                "oc": oc,
+                "date_created": order.get("date_created"),
+                "accounts": [],
+            }
+            try:
+                is_flex, shipping = await _ml_flex_check_order(order)
+                row["shipping"] = shipping
+                if not is_flex:
+                    counts["not_flex"] += 1
+                    continue
+
+                counts["flex_orders"] += 1
+                accounts = await _olist_flex_find_accounts_by_oc(oc)
+                if not accounts:
+                    counts["missing_account"] += 1
+                    row["action"] = "missing_account"
+                    result_rows.append(row)
+                    continue
+
+                for account in accounts:
+                    account_id = str(account.get("id"))
+                    counts["accounts_found"] += 1
+                    markers_before = await _olist_flex_get_markers(account_id)
+                    existing = {
+                        str(item.get("descricao", "")).strip().lower()
+                        for item in markers_before
+                    }
+                    already_tagged = OLIST_FLEX_MARKER in existing
+                    action = "already_tagged" if already_tagged else ("would_tag" if not execute else "tagged")
+
+                    if execute and not already_tagged:
+                        await _olist_flex_add_marker(account_id, OLIST_FLEX_MARKER)
+                        counts["accounts_tagged"] += 1
+                    elif already_tagged:
+                        counts["already_tagged"] += 1
+
+                    row["accounts"].append({
+                        "account_id": int(account_id),
+                        "situacao": account.get("situacao"),
+                        "markers_before": markers_before,
+                        "action": action,
+                    })
+                result_rows.append(row)
+            except Exception as e:
+                counts["errors"] += 1
+                row["action"] = "error"
+                row["error"] = str(e)
+                result_rows.append(row)
+
+        return {
+            "period": {"date_from": date_from, "date_to": end.isoformat()},
+            "marker": OLIST_FLEX_MARKER,
+            "execute": execute,
+            "financial_fields_changed": [],
+            "counts": counts,
+            "preview": result_rows,
+        }
+    except Exception as e:
+        logger.exception("olist_tag_flex_sales failed")
+        return {"error": "Failed to process Flex markers", "detail": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # Middleware de autenticación
 # ---------------------------------------------------------------------------
