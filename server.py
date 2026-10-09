@@ -1744,7 +1744,7 @@ async def _ml_flex_orders_period(
             break
 
         for order in results:
-            oc = str(order.get("id", ""))
+            oc = str(order.get("pack_id") or order.get("id") or "")
             created = str(order.get("date_created", ""))[:10]
             if oc and date_from <= created <= date_to:
                 orders_by_id[oc] = order
@@ -1871,6 +1871,7 @@ async def olist_tag_flex_sales(
             oc = str(order.get("id", ""))
             row: dict[str, Any] = {
                 "oc": oc,
+                "ml_order_id": str(order.get("id", "")),
                 "date_created": order.get("date_created"),
                 "accounts": [],
             }
