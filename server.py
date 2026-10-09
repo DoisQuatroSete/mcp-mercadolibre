@@ -1642,22 +1642,59 @@ async def olist_list_categories() -> dict:
 OLIST_FLEX_MARKER = "flex"
 
 
-async def _olist_flex_find_accounts_by_oc(oc: str) -> list[dict[str, Any]]:
-    """Localiza contas a receber pelo OC informado no número do documento."""
+async def _olist_flex_get_all_accounts() -> list[dict[str, Any]]:
+    """Carrega todas as contas para permitir busca segura no campo historico."""
+    accounts: list[dict[str, Any]] = []
+    offset = 0
+    page_size = 100
+
+    while True:
+        data = await _olist_get(
+            "/contas-receber",
+            {"limit": page_size, "offset": offset},
+        )
+        if isinstance(data, list):
+            items = data
+            total = None
+        else:
+            items = data.get("itens", data.get("items", data.get("results", []))) or []
+            total = (data.get("paginacao") or {}).get("total")
+
+        accounts.extend(items)
+        if not items or len(items) < page_size:
+            break
+        offset += len(items)
+        if isinstance(total, int) and offset >= total:
+            break
+        if offset >= 10000:
+            logger.warning("Olist accounts pagination capped at 10000 records")
+            break
+
+    return accounts
+
+
+async def _olist_flex_find_accounts_by_oc(
+    oc: str,
+    all_accounts: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """Localiza o OC no histórico, que é onde o Olist grava o número da venda.
+
+    Mantém também fallback por numeroDocumento/idVenda para contas antigas.
+    """
     if not _RE_NUMERIC_ID.match(str(oc)):
         raise ValueError("OC deve conter somente dígitos")
 
-    data = await _olist_get(
-        "/contas-receber",
-        {
-            "numeroDocumento": str(oc),
-            "limit": 100,
-            "offset": 0,
-        },
-    )
-    if isinstance(data, list):
-        return data
-    return data.get("itens", data.get("items", data.get("results", []))) or []
+    accounts = all_accounts if all_accounts is not None else await _olist_flex_get_all_accounts()
+    needle = str(oc)
+    matches: list[dict[str, Any]] = []
+    for account in accounts:
+        searchable = " ".join(
+            str(account.get(field) or "")
+            for field in ("historico", "numeroDocumento", "idVenda")
+        )
+        if needle in searchable:
+            matches.append(account)
+    return matches
 
 
 async def _olist_flex_get_markers(account_id: str) -> list[dict[str, Any]]:
@@ -1794,10 +1831,10 @@ async def olist_tag_flex_sales(
     """Identifica vendas Mercado Livre Flex e marca as contas correspondentes.
 
     A venda só é considerada Flex quando o envio do Mercado Livre retorna
-    logistic_type=self_service. A conta é localizada pelo OC. O endpoint
-    altera exclusivamente o marcador flex no Contas a Receber do Olist.
-    Valor, taxa, vencimento, categoria, baixa, estorno e saldo nunca são alterados.
-    execute=False é a prévia padrão.
+    logistic_type=self_service. A conta é localizada pelo OC no histórico do
+    Olist, inclusive contas pagas. O endpoint altera exclusivamente o marcador
+    flex. Valor, taxa, vencimento, categoria, baixa, estorno e saldo nunca são
+    alterados. execute=False é a prévia padrão.
     """
     try:
         start = date.fromisoformat(date_from)
@@ -1815,6 +1852,9 @@ async def olist_tag_flex_sales(
             status=status,
             max_orders=limit,
         )
+        # Uma única leitura paginada do Olist. Assim o OC é procurado no
+        # histórico e não fazemos uma chamada incompleta por venda.
+        all_accounts = await _olist_flex_get_all_accounts()
         result_rows: list[dict[str, Any]] = []
         counts = {
             "orders_scanned": len(orders),
@@ -1842,7 +1882,7 @@ async def olist_tag_flex_sales(
                     continue
 
                 counts["flex_orders"] += 1
-                accounts = await _olist_flex_find_accounts_by_oc(oc)
+                accounts = await _olist_flex_find_accounts_by_oc(oc, all_accounts)
                 if not accounts:
                     counts["missing_account"] += 1
                     row["action"] = "missing_account"
@@ -1869,6 +1909,7 @@ async def olist_tag_flex_sales(
                     row["accounts"].append({
                         "account_id": int(account_id),
                         "situacao": account.get("situacao"),
+                        "historico": account.get("historico"),
                         "markers_before": markers_before,
                         "action": action,
                     })
@@ -1884,6 +1925,7 @@ async def olist_tag_flex_sales(
             "marker": OLIST_FLEX_MARKER,
             "execute": execute,
             "financial_fields_changed": [],
+            "accounts_source": "all_contas_receber; OC buscado em historico, numeroDocumento e idVenda",
             "counts": counts,
             "preview": result_rows,
         }
